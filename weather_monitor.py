@@ -10,8 +10,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 URL = "https://sh.weather.com.cn/zhyj/index.shtml"
 DATA_FILE = Path("data/alerts.json")
@@ -28,18 +27,34 @@ def clean_text(value):
     return re.sub(r"\s+", " ", value or "").strip()
 
 
-def fetch_page():
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/126 Safari/537.36"
-        ),
-        "Referer": "https://sh.weather.com.cn/",
-    }
-    response = requests.get(URL, headers=headers, timeout=30)
-    response.raise_for_status()
-    response.encoding = response.apparent_encoding or "utf-8"
-    return response.text
+def fetch_rendered_text():
+    """用真实浏览器渲染网页，等待右侧动态预警加载完成。"""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            viewport={"width": 1600, "height": 1200},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+        )
+        page.goto(URL, wait_until="domcontentloaded", timeout=90000)
+
+        # 页面预警列表由 JavaScript 异步加载，等待“浦东新区”或“暂无预警”出现。
+        try:
+            page.wait_for_function(
+                """() => document.body.innerText.includes('浦东新区')
+                       || document.body.innerText.includes('暂无预警')""",
+                timeout=30000,
+            )
+        except Exception:
+            pass
+
+        page.wait_for_timeout(8000)
+        body_text = page.locator("body").inner_text()
+        browser.close()
+        return clean_text(body_text)
 
 
 def parse_start_time(text, fallback):
@@ -55,54 +70,45 @@ def parse_start_time(text, fallback):
     return fallback
 
 
-def extract_alerts(page_html):
-    soup = BeautifulSoup(page_html, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-
+def extract_alerts(page_text):
+    """
+    从浏览器实际渲染出的文字中，提取浦东新区橙色/红色预警。
+    网站通常按：标题 -> 时间 -> 详细正文 的顺序显示。
+    """
     found = []
     seen = set()
 
-    # 从所有包含“浦东新区 + 橙色/红色 + 预警”的页面元素中提取最完整文本。
-    for node in soup.find_all(string=re.compile(TARGET_REGION)):
-        current = node.parent
-        candidates = []
-        for _ in range(7):
-            if current is None:
-                break
-            text = clean_text(current.get_text(" ", strip=True))
-            if (
-                TARGET_REGION in text
-                and "预警" in text
-                and any(level in text for level in TARGET_LEVELS)
-            ):
-                candidates.append(text)
-            current = current.parent
+    title_pattern = re.compile(
+        r"(?:上海市)?浦东新区[^。；\n]{0,40}?(?:橙色|红色)[^。；\n]{0,20}?预警"
+    )
 
-        if not candidates:
+    matches = list(title_pattern.finditer(page_text))
+    for index, match in enumerate(matches):
+        title = clean_text(match.group(0))
+        level = "红色" if "红色" in title else "橙色"
+
+        # 从标题起，截取到下一条预警标题之前，最多 1200 字。
+        start_pos = match.start()
+        end_pos = matches[index + 1].start() if index + 1 < len(matches) else min(len(page_text), start_pos + 1200)
+        block = clean_text(page_text[start_pos:end_pos])
+
+        # 确保详情确实属于浦东新区，并包含发布正文。
+        if TARGET_REGION not in block or not any(level_name in block for level_name in TARGET_LEVELS):
             continue
 
-        # 选择既有详细内容、又不会把整页内容全部包进去的候选。
-        reasonable = [t for t in candidates if 20 <= len(t) <= 1200]
-        description = max(reasonable or candidates, key=len)
-        description = clean_text(html.unescape(description))
-
-        # 避免菜单、页脚等内容混入。
-        for marker in ["信息来源：", "关于我们", "Copyright"]:
-            if marker in description:
-                description = description.split(marker, 1)[0].strip()
+        # 常见详情正文以“浦东新区气象台……”开始。
+        detail_match = re.search(
+            r"(浦东新区气象台20\d{2}年.*?)(?=(?:上海市)?[\u4e00-\u9fa5]{2,12}区[^。；]{0,40}(?:蓝色|黄色|橙色|红色)[^。；]{0,20}预警|$)",
+            block,
+        )
+        description = clean_text(detail_match.group(1) if detail_match else block)
+        description = description[:1600]
 
         if description in seen:
             continue
         seen.add(description)
 
-        title_match = re.search(
-            r"([^。；]{0,40}浦东新区[^。；]{0,40}(?:橙色|红色)[^。；]{0,20}预警[^。；]{0,20})",
-            description,
-        )
-        title = clean_text(title_match.group(1)) if title_match else description[:100]
-        level = "红色" if "红色" in title or "红色" in description else "橙色"
-        start = parse_start_time(description, now_shanghai())
+        start = parse_start_time(description + " " + block, now_shanghai())
         alert_id = re.sub(r"\W+", "", title) + "_" + start.strftime("%Y%m%d%H%M")
 
         found.append(
@@ -119,13 +125,7 @@ def extract_alerts(page_html):
             }
         )
 
-    # 同一预警可能被多个嵌套元素命中，只保留描述最完整的一条。
-    unique = {}
-    for alert in found:
-        key = (alert["level"], alert["date_from"][:16])
-        if key not in unique or len(alert["description"]) > len(unique[key]["description"]):
-            unique[key] = alert
-    return list(unique.values())
+    return found
 
 
 def load_history():
@@ -140,7 +140,8 @@ def load_history():
 def save_history(history):
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     DATA_FILE.write_text(
-        json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(history, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
 
@@ -154,6 +155,7 @@ def merge_history(history, current_alerts):
             old = history_by_id[current["id"]]
             old["last_seen"] = now.isoformat()
             old["active"] = True
+            old["date_to"] = None
             if len(current["description"]) > len(old.get("description", "")):
                 old["description"] = current["description"]
         else:
@@ -183,7 +185,7 @@ def weekly_rows(history):
     for item in history:
         try:
             start = datetime.fromisoformat(item["date_from"])
-        except ValueError:
+        except (ValueError, TypeError):
             continue
         if start >= cutoff or item.get("active"):
             rows.append(item)
@@ -233,6 +235,7 @@ def send_email(subject, body):
     gmail_user = os.environ.get("GMAIL_USER")
     gmail_password = os.environ.get("GMAIL_APP_PASSWORD")
     recipient = os.environ.get("RECIPIENT_EMAIL", "june.shao@disney.com")
+
     if not gmail_user or not gmail_password:
         raise RuntimeError("缺少 GMAIL_USER 或 GMAIL_APP_PASSWORD GitHub Secret")
 
@@ -252,16 +255,22 @@ def main():
     parser.add_argument("--test", action="store_true", help="强制发送测试邮件")
     args = parser.parse_args()
 
-    page_html = fetch_page()
-    current = extract_alerts(page_html)
+    rendered_text = fetch_rendered_text()
+    current = extract_alerts(rendered_text)
+
+    print(f"当前抓取到浦东新区橙色/红色预警：{len(current)} 条")
+    for item in current:
+        print(item["title"])
+        print(item["description"])
+
     history = merge_history(load_history(), current)
     save_history(history)
 
     now = now_shanghai()
-    should_send = args.test or now.weekday() == 4  # 周五（上海时间）
+    should_send = args.test or now.weekday() == 4
+
     if should_send:
         rows = weekly_rows(history)
-        # 正式周报仅在有预警时发送；手动测试即使无预警也发送。
         if rows or args.test:
             subject, body = build_email(rows, test=args.test)
             send_email(subject, body)
@@ -269,7 +278,7 @@ def main():
         else:
             print("本周无符合条件的预警，不发送邮件。")
     else:
-        print(f"已完成检查，当前匹配预警 {len(current)} 条。")
+        print("本次只保存预警记录，不发送邮件。")
 
 
 if __name__ == "__main__":
