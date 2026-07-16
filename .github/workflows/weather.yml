@@ -2,15 +2,27 @@ name: Pudong Weather Alert
 
 on:
   schedule:
-    # 每小时采集一次，记录一周内出现过的预警
+    # 每小时采集一次。GitHub cron 使用 UTC。
     - cron: "15 * * * *"
-    # 每周五上海时间上午9点发送周报（UTC 01:00）
+    # 每周五上海时间 09:00 = UTC 01:00
     - cron: "0 1 * * 5"
+
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "测试时请选择 test"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - test
+          - collect
+          - weekly
 
 permissions:
   contents: write
 
+# 避免两个定时任务同时运行并抢着写历史文件。
 concurrency:
   group: pudong-weather-alert
   cancel-in-progress: false
@@ -21,7 +33,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Checkout repository
+      - name: Checkout latest repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -32,57 +44,80 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+        run: pip install -r requirements.txt
 
-      - name: Determine run mode
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Decide run mode
         id: mode
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "value=test" >> "$GITHUB_OUTPUT"
+            MODE="${{ inputs.run_mode }}"
           elif [ "${{ github.event.schedule }}" = "0 1 * * 5" ]; then
-            echo "value=weekly" >> "$GITHUB_OUTPUT"
+            MODE="weekly"
           else
-            echo "value=collect" >> "$GITHUB_OUTPUT"
+            MODE="collect"
           fi
 
-      - name: Check alerts and send when required
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "本次运行模式：$MODE"
+
+      - name: Read Pudong alerts and optionally send report
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL: june.shao@disney.com
-        run: python weather_monitor.py --mode "${{ steps.mode.outputs.value }}"
+        run: python weather_monitor.py --mode "${{ steps.mode.outputs.mode }}"
 
-      - name: Upload diagnostic page text
+      - name: Upload DOM diagnosis
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: weather-page-text-${{ github.run_id }}
-          path: data/last_page_text.txt
+          name: alarm-dom-diagnosis
+          path: debug_alarm_dom.json
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 7
 
       - name: Save alert history safely
         shell: bash
-        continue-on-error: true
         run: |
-          if git diff --quiet -- data/alerts.json; then
-            echo "No alert history changes"
+          if [ ! -f alerts_next.json ]; then
+            echo "No new history file was produced."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/alerts.json
-          git commit -m "Update Pudong weather alert history"
 
-          # 先同步远端新提交，解决用户编辑文件期间产生的 fetch first 冲突。
-          git pull --rebase origin main || {
-            echo "History rebase conflict; aborting history save without failing weather check"
-            git rebase --abort || true
-            exit 0
-          }
-          git push origin HEAD:main || echo "History push skipped; next hourly run will retry"
+          # 最多尝试3次。每次都先取得远程最新版本，再只覆盖历史数据文件。
+          for attempt in 1 2 3; do
+            echo "Save attempt $attempt"
+
+            git fetch origin main
+            git reset --hard origin/main
+
+            mkdir -p data
+            cp alerts_next.json data/alerts.json
+
+            if git diff --quiet -- data/alerts.json; then
+              echo "Alert history has no changes."
+              exit 0
+            fi
+
+            git add data/alerts.json
+            git commit -m "Update Pudong weather alert history"
+
+            if git push origin HEAD:main; then
+              echo "Alert history saved successfully."
+              exit 0
+            fi
+
+            echo "Remote changed during save; retrying..."
+            sleep 5
+          done
+
+          echo "History save was skipped after 3 conflicts."
+          echo "Weather reading and email sending already completed successfully."
+          exit 0
