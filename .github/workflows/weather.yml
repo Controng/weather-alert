@@ -1,0 +1,88 @@
+name: Pudong Weather Alert
+
+on:
+  schedule:
+    # 每小时采集一次，记录一周内出现过的预警
+    - cron: "15 * * * *"
+    # 每周五上海时间上午9点发送周报（UTC 01:00）
+    - cron: "0 1 * * 5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pudong-weather-alert
+  cancel-in-progress: false
+
+jobs:
+  check-weather:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Determine run mode
+        id: mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=test" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 1 * * 5" ]; then
+            echo "value=weekly" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=collect" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check alerts and send when required
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: june.shao@disney.com
+        run: python weather_monitor.py --mode "${{ steps.mode.outputs.value }}"
+
+      - name: Upload diagnostic page text
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weather-page-text-${{ github.run_id }}
+          path: data/last_page_text.txt
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Save alert history safely
+        shell: bash
+        continue-on-error: true
+        run: |
+          if git diff --quiet -- data/alerts.json; then
+            echo "No alert history changes"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/alerts.json
+          git commit -m "Update Pudong weather alert history"
+
+          # 先同步远端新提交，解决用户编辑文件期间产生的 fetch first 冲突。
+          git pull --rebase origin main || {
+            echo "History rebase conflict; aborting history save without failing weather check"
+            git rebase --abort || true
+            exit 0
+          }
+          git push origin HEAD:main || echo "History push skipped; next hourly run will retry"
