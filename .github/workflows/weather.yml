@@ -2,7 +2,7 @@ name: Pudong Weather Alert
 
 on:
   schedule:
-    # 每小时运行一次，用于保存本周出现过的预警。
+    # 每小时第15分钟运行一次，保存本周出现过的浦东橙色/红色预警
     - cron: "15 * * * *"
   workflow_dispatch:
     inputs:
@@ -18,6 +18,7 @@ permissions:
 jobs:
   check-weather:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,8 +28,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: pip install -r requirements.txt
+
+      - name: Install Chromium browser
+        run: python -m playwright install --with-deps chromium
 
       - name: Check alerts and optionally send report
         env:
