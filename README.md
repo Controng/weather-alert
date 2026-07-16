@@ -1,15 +1,31 @@
 # 浦东新区橙色/红色天气预警邮件周报
 
-数据源：上海天气预警官网：`https://sh.weather.com.cn/zhyj/index.shtml`
+数据来源：
 
-功能：
-- 每小时用浏览器渲染网页并采集一次；
-- 只记录“浦东新区”且等级为“橙色”或“红色”的预警；
-- 每周五上海时间上午 9:00 汇总过去 7 天并发送邮件；
-- 若一周没有符合条件的预警，正式周报不发送；
-- 在 Actions 页面手动运行时，会发送一封测试邮件；
-- 测试运行会附带 `weather-page-text` 诊断文件，便于排查网页变化。
+https://sh.weather.com.cn/zhyj/index.shtml
 
-需要的 GitHub Secrets：
+程序直接读取网页 DOM：
+
+- `#alarmList li`
+- `.alarm-head span`：预警标题
+- `.alarm-head em`：发布时间
+- `.alarm-body`：详细内容
+
+## 自动运行
+
+- 每小时采集一次预警；
+- 每周五上海时间上午 9:00 发送过去 7 天周报；
+- 只统计浦东新区的橙色或红色预警；
+- 无符合条件记录时，正式周报不发送；
+- 手动运行选择 `test`，会发送测试邮件。
+
+## GitHub Secrets
+
+仓库中需要保存：
+
 - `GMAIL_USER`
 - `GMAIL_APP_PASSWORD`
+
+收件邮箱固定为：
+
+`june.shao@disney.com`
